@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Provision and operate an isolated Herdr lab session without risking the live
-# default session.
+# pre-existing sessions, including a named primary with no running default.
 #
 # Usage:
 #   fm-herdr-lab.sh name <label>
@@ -25,8 +25,11 @@
 # delete is available only through teardown.
 # Both paths perform a fresh refuse-default check immediately before each
 # destructive call.
-# Provision records the running default session as a fleet-state tripwire and
-# teardown requires that record to be identical afterward.
+# Provision records the non-target session inventory as a fleet-state tripwire
+# and teardown requires its API identities, live socket device/inode identities,
+# and running states unchanged afterward.
+# At least one non-target session must be running; malformed or duplicate session
+# identities fail closed, whether the primary is default or named.
 # The viewer command attaches or detaches one real foreground Herdr client on
 # an owned lab session over a fixed 40-row by 120-column pty;
 # bin/fm-herdr-lab-viewer.py owns the pty mechanics.
@@ -77,22 +80,44 @@ fm_herdr_lab_session_list() { # <session>
 }
 
 fm_herdr_lab_fleet_state() { # <session>
-  local name=$1 sessions snapshot
+  local name=$1 sessions snapshot entry socket identity parent
   sessions=$(fm_herdr_lab_session_list "$name" 2>/dev/null) || {
     fm_herdr_lab_error "cannot read Herdr sessions for the fleet-state tripwire"
     return 1
   }
-  snapshot=$(printf '%s' "$sessions" | jq -c '
-    [.sessions[]? | select(.default == true)]
-    | if length == 1 and .[0].name == "default" and .[0].running == true
-      then .[0] | {name, default, running, socket_path}
-      else empty
-      end
+  snapshot=$(printf '%s' "$sessions" | jq -ce --arg name "$name" '
+    .sessions
+    | if type != "array" then error("missing session inventory") else . end
+    | if all(.[]; (.name | type == "string" and length > 0)
+        and (.default | type == "boolean") and (.running | type == "boolean")
+        and (.socket_path | type == "string" and startswith("/"))
+        and (.default == (.name == "default")))
+        and ([.[].name] | length == (unique | length))
+        and ([.[].socket_path] | length == (unique | length))
+      then . else error("ambiguous session identity") end
+    | map(select(.name != $name) | {name, default, running, socket_path, session_dir})
+    | if any(.[]; .running) then sort_by(.name)
+      else error("no pre-existing live session") end
   ' 2>/dev/null)
   [ -n "$snapshot" ] || {
-    fm_herdr_lab_error "fleet-state tripwire requires exactly one running default session"
+    fm_herdr_lab_error "fleet-state tripwire requires an unambiguous pre-existing live session inventory"
     return 1
   }
+  while IFS= read -r entry; do
+    parent=$(printf '%s' "$entry" | jq -r '.name') || return 1
+    socket=$(printf '%s' "$entry" | jq -r '.socket_path') || return 1
+    [ -S "$socket" ] || {
+      fm_herdr_lab_error "live session '$parent' has no verifiable socket identity"
+      return 1
+    }
+    identity=$(stat -Lc '%d:%i' "$socket" 2>/dev/null) \
+      || identity=$(stat -f '%d:%i' "$socket" 2>/dev/null) || return 1
+    case "$identity" in
+      ''|*[!0-9:]*) fm_herdr_lab_error "invalid socket identity for '$parent'"; return 1 ;;
+    esac
+    snapshot=$(printf '%s' "$snapshot" | jq -c --arg parent "$parent" --arg identity "$identity" \
+      'map(if .name == $parent then . + {socket_identity:$identity} else . end)') || return 1
+  done < <(printf '%s' "$snapshot" | jq -c '.[] | select(.running)')
   printf '%s\n' "$snapshot"
 }
 
@@ -466,7 +491,7 @@ fm_herdr_lab_check_tripwire() { # <session>
   before=$(cat "$tripwire")
   after=$(fm_herdr_lab_fleet_state "$name") || return 1
   [ "$before" = "$after" ] || {
-    fm_herdr_lab_error "FLEET-STATE TRIPWIRE FAILED: default session changed during lab work"
+    fm_herdr_lab_error "FLEET-STATE TRIPWIRE FAILED: pre-existing session inventory changed during lab work"
     fm_herdr_lab_error "before: $before"
     fm_herdr_lab_error "after:  $after"
     return 1

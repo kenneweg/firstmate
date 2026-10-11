@@ -516,6 +516,11 @@
 # active without a markdown file; any active automatic backend without
 # compatible tasks-axi refuses before creating lifecycle state.
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> [mode=<mode> yolo=<on|off>] window=<backend-target> worktree=<path>
+# --guard-role worker|verifier selects a reviewed Codex project guard from
+# config/codex-project-guards.json. A matching project requires this explicit
+# role; fm-codex-guard.py owns config fields, source isolation, and supported
+# authentication. Other launches keep their existing hook posture. Relaunch
+# preserves the recorded role and revalidates current approved configuration.
 # A ship task records the explicit mode/yolo it was passed; a secondmate spawn records
 # mode=secondmate, yolo=off, home=, and projects=; a scout records neither, and both the
 # success line and state/<id>.meta omit them.
@@ -711,6 +716,9 @@ fm_refuse_if_gate_agent
 KIND=ship
 KIND_SET=0
 HARNESS_ARG=
+GUARD_ROLE=
+CODEX_GUARD=off
+CODEX_GUARD_DIR=
 MODEL=
 EFFORT=
 BACKEND_ARG=
@@ -747,6 +755,7 @@ for a in "$@"; do
       HARNESS_ARG=$a
       HARNESS_SET=1
       ;;
+    guard-role) GUARD_ROLE=$a ;;
     model)
       MODEL=$a
       MODEL_SET=1
@@ -819,6 +828,8 @@ for a in "$@"; do
     BACKEND_SET=1
     ;;
   --mode) want_value=mode ;;
+  --guard-role) want_value=guard-role ;;
+  --guard-role=*) GUARD_ROLE=${a#--guard-role=} ;;
   --mode=*)
     MODE=${a#--mode=}
     MODE_SET=1
@@ -2131,7 +2142,8 @@ launch_template() {
     printf '%s' '__MODELFLAG____EFFORTFLAG____BRIEFDOORBELL__'
     ;;
   # --disable hooks (equivalent to -c features.hooks=false) turns codex's whole
-  # lifecycle-hook layer off for CREWMATE and SCOUT launches only.
+  # lifecycle-hook layer off for default CREWMATE and SCOUT launches only.
+  # Reviewed project opt-ins replace this posture through fm-codex-guard.py.
   # Without it a crewmate launch parks forever on codex's hook-trust modal
   # ("N hooks are new or changed"), whose selection sits on "Review hooks" -
   # neither trusting nor declining. Firstmate's key plane carries Enter, Escape
@@ -2139,7 +2151,7 @@ launch_template() {
   # pre-accepting the prompt by writing codex's own trust store would manufacture
   # an operator consent that was never given. The hooks it asks about are the
   # OPERATOR's machine-level ~/.codex/hooks.json plus any project-local
-  # .codex/hooks.json, and a crewmate needs none of them: its turn-end signal is
+  # .codex/hooks.json. Default launches do not import them; their turn-end signal is
   # the -c notify= program on this same launch (verified still firing with hooks
   # disabled, codex-cli 0.151.0), and firstmate's own .codex/hooks.json registers
   # PRIMARY-session infrastructure that already stands down in a child worktree.
@@ -3139,6 +3151,23 @@ else
   PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
   WT=""
   BRIEF="$DATA/$ID/brief.md"
+fi
+if [ "$RELAUNCH" -eq 1 ]; then
+  recorded_guard_role=$(fm_meta_get "$RELAUNCH_META" guard_role)
+  if [ -n "$GUARD_ROLE" ] && [ "$GUARD_ROLE" != "$recorded_guard_role" ]; then
+    echo "error: relaunch cannot change the task's recorded guard role" >&2
+    exit 1
+  fi
+  GUARD_ROLE=$recorded_guard_role
+fi
+if [ -n "$GUARD_ROLE" ] && { [ "$HARNESS" != codex ] || [ "$KIND" = secondmate ] || [ "$RAW_LAUNCH" != 0 ]; }; then
+  echo "error: --guard-role requires a canonical Codex ship or scout launch" >&2
+  exit 1
+fi
+if [ "$HARNESS" = codex ] && [ "$KIND" != secondmate ] && [ "$RAW_LAUNCH" = 0 ] \
+  && { [ -e "$CONFIG/codex-project-guards.json" ] || [ -n "$GUARD_ROLE" ]; }; then
+  CODEX_GUARD=$(python3 "$FM_ROOT/bin/fm-codex-guard.py" check \
+    "$CONFIG/codex-project-guards.json" "$PROJ_ABS" "$GUARD_ROLE") || exit 1
 fi
 # Project capacity admission (bin/fm-project-capacity-lib.sh owns the
 # declaration, what holds a place, and why this is race-safe). A fresh worker
@@ -4608,6 +4637,16 @@ mkdir -p "$TASK_TMP/gotmp"
 # check or leak into a commit.
 mkdir -p "$STATE"
 STATE_REAL=$(cd "$STATE" && pwd -P)
+if [ "$CODEX_GUARD" = on ]; then
+  CODEX_GUARD_DIR=$(mktemp -d "$STATE_REAL/$ID.codex-guard.XXXXXX") || exit 1
+  # Prepare refuses adoption, so reserve only a unique name here, then let the
+  # helper create the private directory with its credential-safe permissions.
+  rmdir "$CODEX_GUARD_DIR" || exit 1
+  python3 "$FM_ROOT/bin/fm-codex-guard.py" prepare "$CONFIG/codex-project-guards.json" \
+    "$PROJ_ABS" "$WT" "$GUARD_ROLE" "$CODEX_GUARD_DIR" || exit 1
+  LAUNCH=${LAUNCH/codex /"python3 $(shell_quote "$FM_ROOT/bin/fm-codex-guard.py") launch $(shell_quote "$CODEX_GUARD_DIR") -- "}
+  LAUNCH=${LAUNCH/--disable hooks /}
+fi
 TURNEND="$STATE_REAL/$ID.turn-ended"
 exclude_path() {
   local rel=$1 EXCL
@@ -5185,7 +5224,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp base_branch model effort account account_provider busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp base_branch model effort account account_provider busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx guard_role codex_guard_dir", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -5198,6 +5237,8 @@ preserve_relaunch_meta() {
   echo "project=$PROJ_ABS"
   echo "harness=$HARNESS"
   echo "kind=$KIND"
+  [ -z "$GUARD_ROLE" ] || echo "guard_role=$GUARD_ROLE"
+  [ -z "$CODEX_GUARD_DIR" ] || echo "codex_guard_dir=$CODEX_GUARD_DIR"
   [ -z "$MODE" ] || echo "mode=$MODE"
   [ -z "$YOLO" ] || echo "yolo=$YOLO"
   [ -z "${BRANCH:-}" ] || echo "branch=$BRANCH"
@@ -5675,6 +5716,34 @@ if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
   spawn_herdr_presentation_order_lock_release
 fi
 spawn_send_key "$T" Enter
+if [ "$CODEX_GUARD" = on ]; then
+  # Codex 0.162.1 asks for restricted folder access even with saved untrusted
+  # configuration. Answer only that exact, non-persisting choice; never grant
+  # project trust or answer the separate hook-review dialog.
+  codex_guard_started=0
+  codex_guard_answered=0
+  for ((codex_guard_poll=0; codex_guard_poll<60; codex_guard_poll++)); do
+    codex_guard_screen=$(fm_backend_capture "$BACKEND" "$T" 120 "$W" 2>/dev/null || true)
+    codex_guard_choice=$(printf '%s' "$codex_guard_screen" | python3 "$FM_ROOT/bin/fm-codex-guard.py" startup-choice) || exit 1
+    case "$codex_guard_choice" in
+      restricted)
+        if [ "$codex_guard_answered" = 0 ]; then
+          spawn_send_key "$T" Enter
+          codex_guard_answered=1
+        fi ;;
+      waiting)
+        if [ "$codex_guard_answered" = 1 ]; then
+          codex_guard_started=1
+          break
+        fi ;;
+    esac
+    sleep 0.5
+  done
+  if [ "$codex_guard_started" != 1 ]; then
+    echo 'error: Codex restricted-folder startup was not confirmed' >&2
+    exit 1
+  fi
+fi
 if [ "$HARNESS" = kimi ]; then
   if ! kimi_wait_for_ready; then
     kimi_spawn_fail "$KIMI_READY_FAILURE_DETAIL"

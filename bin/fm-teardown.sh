@@ -3791,6 +3791,12 @@ rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.progress" \
 # read-only by its installer.
 chmod u+w "$STATE/$ID.git-hooks" 2>/dev/null || true
 rm -rf "$STATE/$ID.inbox" "$STATE/$ID.git-hooks"
+# Private Codex guard homes include copied authentication. Remove only this
+# landed task's generations, under the same teardown ownership gate as above.
+for codex_guard_dir in "$STATE/$ID.codex-guard."*; do
+  [ -d "$codex_guard_dir" ] && [ ! -L "$codex_guard_dir" ] || continue
+  rm -rf "$codex_guard_dir"
+done
 # A presentation journal the close path left behind is orphaned once the
 # recorded pane is proven gone (the Herdr gate above) unless it still names a
 # live projected workspace - a version 2 binding of some other pane, or a

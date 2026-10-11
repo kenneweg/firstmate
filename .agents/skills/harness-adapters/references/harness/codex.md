@@ -19,14 +19,17 @@ Verified on 2026-06-11 with codex-cli 0.139.0 unless a fact gives a newer versio
 A directory trust dialog appears on the first run for a repository root: "Do you trust the contents of this directory?"
 Accept it with Enter and verify the instructions begin processing.
 The decision persists for the repository, so later worktrees of the same project skip it.
+For reviewed project guards, Codex instead renders "Folder access" with "Open restricted" selected.
+The launcher answers only that exact non-persisting restricted choice, keeps project layers untrusted, and refuses any hook-review or project-trust prompt.
 
 ## Hook trust
 
 A second dialog, "Hooks need review - N hooks are new or changed", appears whenever the machine's `~/.codex/hooks.json` or a project's own `.codex/hooks.json` carries a hook Codex has not persisted trust for.
 It is unanswerable rather than merely inconvenient: its selection starts on "Review hooks", which is neither trusting nor declining, and Firstmate's key plane carries Enter, Escape and Ctrl-C with no arrow navigation.
 Writing Codex's own trust store to pre-accept it would manufacture an operator consent that was never given.
-So crewmate and scout launches disable Codex's hook layer outright (`bin/fm-spawn.sh`'s launch template owns the flag), which is the opposite of `--dangerously-bypass-hook-trust` - that flag RUNS the untrusted hooks.
-A crewmate loses nothing: its turn-end signal is the `-c notify=` program on the same launch, and the Firstmate hooks in a project's `.codex/hooks.json` are primary-session infrastructure that stands down in a child worktree.
+Default crewmate and scout launches disable Codex's hook layer outright (`bin/fm-spawn.sh`'s launch template owns the flag), which is the opposite of `--dangerously-bypass-hook-trust` - that flag RUNS the untrusted hooks.
+Their turn-end signal is the `-c notify=` program on the same launch, while automatic project safety hooks are disabled too.
+For an explicitly reviewed project opt-in, [configuration](../../../../../docs/configuration.md#reviewed-codex-project-guards-configcodex-project-guardsjson) and `../../../../../bin/fm-codex-guard.py --help` own the isolated hook-source path and its guardrail boundary.
 A secondmate is a primary in its own home and keeps its hooks, so an unanswerable modal there is still possible and is the operator's own hook review to settle.
 
 ## Skill popup

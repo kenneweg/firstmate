@@ -6,6 +6,42 @@ This record contains reusable version-scoped evidence for active runtime guarant
 The backend guides own current setup, safety boundaries, and limitations.
 Exact task chronology, branch names, temporary homes, local paths, process ids, thread ids, and delivery transcripts remain in private reports or PR evidence.
 
+## Codex reviewed project guards
+
+Verified on 2026-10-11 with Codex CLI 0.162.1 and Herdr 0.9.3 on Linux.
+The canonical ship/scout relaunch uses a fresh private authentication/configuration home, hash-pinned standalone executable, all-tool PreToolUse and Stop hooks, and an explicit worker/verifier role.
+Native hooks/list must report exactly those two generated user hooks before invocation-local hook-trust bypass.
+The local TUI still renders a restricted-folder disclosure; the launcher selects only the verified "Open restricted" default and confirms it disappears, without persisting project trust.
+The private config retains untrusted project entries and unchanged reviewed definitions after both turns.
+No blanket project trust, original user hook trust write, or arbitrary project/user/plugin hook execution is required.
+
+Refresh the portable logic and installed native source checks with:
+
+```sh
+bash tests/fm-codex-guard.test.sh
+bash tests/fm-herdr-lab.test.sh
+bash tests/fm-codex-hook-layer-live-e2e.test.sh
+```
+
+Refresh the single trivial runtime probe with:
+
+```sh
+FM_CODEX_PROJECT_GUARD_LIVE=1 bash tests/fm-codex-project-guard-live-e2e.test.sh
+```
+
+The named lab uses the guarded lifecycle helper and a toy independent repository copy, with no shared worktree-pool operations or remote writes.
+Worker own-file writes and commits execute; four coordinator-only fixture actions are automatically denied.
+An unfinished Stop blocks the first completion and allows the corrected committed completion.
+Verifier reads execute, and writes/commits are denied despite a worker environment hint.
+Both roles finish through normal native notification plus a successful Stop event.
+An adversarial original/project hook sentinel remains absent, and adding another source to the private home refuses launch before any hook runs.
+The helper preserves the preexisting session inventory and each live API socket identity through teardown, including a named parent with stopped default.
+
+This evidence proves fixture transport and launch isolation, not complete mediation of arbitrary programs.
+Codex hook errors and unsupported tool paths can fail open; hooks are guardrails, not an OS sandbox.
+Production guard implementation review and its native acceptance remain the project's responsibility.
+The operator configuration and refusal boundary are owned by [configuration](../configuration.md#reviewed-codex-project-guards-configcodex-project-guardsjson) and [`fm-codex-guard.py --help`](../../bin/fm-codex-guard.py).
+
 ## Harness detection precedence
 
 Firstmate's own harness comes from two kinds of evidence, and `bin/fm-harness.sh` owns how they combine: an environment marker names its harness, and the nearest harness process in the parent chain proves who owns the process tree.

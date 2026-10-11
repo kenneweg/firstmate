@@ -12,7 +12,13 @@ FAKE_LOG="$TMP_ROOT/herdr.log"
 TRIPWIRES="$TMP_ROOT/tripwires"
 REAL_SLEEP=$(command -v sleep)
 mkdir -p "$FAKE_STATE"
-printf '%s\n' '/home/test/.config/herdr/herdr.sock' > "$FAKE_STATE/default-socket"
+python3 - "$FAKE_STATE/parent.sock" <<'PY_SOCKET'
+import socket, sys
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(sys.argv[1])
+sock.close()
+PY_SOCKET
+printf '%s\n' "$FAKE_STATE/parent.sock" > "$FAKE_STATE/default-socket"
 : > "$FAKE_LOG"
 
 cat > "$FAKEBIN/herdr" <<'SH'
@@ -31,18 +37,23 @@ done
 [ "${previous:-}" = --session ] || { echo "fake herdr: missing --session before any -- delimiter" >&2; exit 90; }
 session=$last
 default_socket=$(cat "$state/default-socket")
+parent_name=default
+parent_default=true
+[ ! -f "$state/named-parent" ] || { parent_name=firstmate; parent_default=false; }
+parent_running=true
+[ ! -f "$state/parent-stopped" ] || parent_running=false
 lab_state=absent
 [ ! -f "$state/$session" ] || lab_state=$(cat "$state/$session")
 
 case "$1 ${2:-}" in
   "session list")
     if [ "$lab_state" = absent ] || [ "$lab_state" = deleted ]; then
-      jq -nc --arg socket "$default_socket" '{sessions:[{default:true,name:"default",running:true,socket_path:$socket}]}'
+      jq -nc --arg parent "$parent_name" --argjson default "$parent_default" --argjson live "$parent_running" --arg socket "$default_socket" '{sessions:[{default:$default,name:$parent,running:$live,socket_path:$socket}]}'
     else
       running=false
       [ "$lab_state" = running ] && running=true
-      jq -nc --arg socket "$default_socket" --arg name "$session" --argjson running "$running" \
-        '{sessions:[{default:true,name:"default",running:true,socket_path:$socket},{default:false,name:$name,running:$running,socket_path:("/tmp/" + $name + ".sock")}]}'
+      jq -nc --arg parent "$parent_name" --argjson default "$parent_default" --argjson live "$parent_running" --arg socket "$default_socket" --arg name "$session" --argjson running "$running" \
+        '{sessions:[{default:$default,name:$parent,running:$live,socket_path:$socket},{default:false,name:$name,running:$running,socket_path:("/tmp/" + $name + ".sock")}]}'
     fi
     ;;
   "server --session")
@@ -219,9 +230,56 @@ test_changed_default_trips_after_teardown() {
   run_with_fake fm_herdr_lab_teardown "$name" >/dev/null 2>&1 || status=$?
   expect_code 1 "$status" "changed default fleet state must fail teardown"
   assert_present "$TRIPWIRES/$name.fleet-state.json" "failed tripwire should retain evidence"
-  printf '%s\n' '/home/test/.config/herdr/herdr.sock' > "$FAKE_STATE/default-socket"
+  printf '%s\n' "$FAKE_STATE/parent.sock" > "$FAKE_STATE/default-socket"
   rm -f "$TRIPWIRES/$name.fleet-state.json"
   pass "fm-herdr-lab: changed default fleet state is a hard failure"
+}
+
+test_named_parent_inventory() {
+  local name="fm-lab-named-parent-$$" status=0
+  touch "$FAKE_STATE/named-parent"
+  run_with_fake fm_herdr_lab_provision "$name" || fail "named parent without default must allow lab provisioning"
+  jq -e --arg socket "$FAKE_STATE/parent.sock" 'length == 1 and .[0].name == "firstmate" and .[0].default == false and .[0].running == true and .[0].socket_path == $socket and (.[0].socket_identity | test("^[0-9]+:[0-9]+$"))' \
+    "$TRIPWIRES/$name.fleet-state.json" >/dev/null || fail "tripwire did not pin named parent identity"
+  run_with_fake fm_herdr_lab_teardown "$name" || fail "named parent unchanged must allow teardown"
+
+  name="fm-lab-parent-stopped-$$"
+  run_with_fake fm_herdr_lab_provision "$name" || fail "named parent stop fixture failed"
+  touch "$FAKE_STATE/parent-stopped"
+  run_with_fake fm_herdr_lab_teardown "$name" >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "stopped named parent must trip the fleet check"
+  assert_present "$TRIPWIRES/$name.fleet-state.json" "parent change lost durable evidence"
+  rm "$FAKE_STATE/parent-stopped"
+  run_with_fake fm_herdr_lab_teardown "$name" || fail "restored named parent retry failed"
+
+  name="fm-lab-parent-replaced-$$"
+  run_with_fake fm_herdr_lab_provision "$name" || fail "named parent identity fixture failed"
+  printf '%s\n' /replacement/socket > "$FAKE_STATE/default-socket"
+  status=0
+  run_with_fake fm_herdr_lab_teardown "$name" >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "replaced named parent socket identity must trip the fleet check"
+  assert_present "$TRIPWIRES/$name.fleet-state.json" "identity change lost durable evidence"
+  printf '%s\n' "$FAKE_STATE/parent.sock" > "$FAKE_STATE/default-socket"
+  run_with_fake fm_herdr_lab_teardown "$name" || fail "restored parent identity retry failed"
+
+  name="fm-lab-parent-restart-$$"
+  run_with_fake fm_herdr_lab_provision "$name" || fail "parent restart fixture failed"
+  mv "$FAKE_STATE/parent.sock" "$FAKE_STATE/old-parent.sock"
+  python3 - "$FAKE_STATE/parent.sock" <<'PY_SOCKET'
+import socket, sys
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(sys.argv[1])
+sock.close()
+PY_SOCKET
+  status=0
+  run_with_fake fm_herdr_lab_teardown "$name" >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "same-path parent socket replacement must trip the fleet check"
+  assert_present "$TRIPWIRES/$name.fleet-state.json" "parent restart lost durable evidence"
+  rm "$FAKE_STATE/parent.sock"
+  mv "$FAKE_STATE/old-parent.sock" "$FAKE_STATE/parent.sock"
+  run_with_fake fm_herdr_lab_teardown "$name" || fail "restored socket inode retry failed"
+  rm "$FAKE_STATE/named-parent"
+  pass "fm-herdr-lab: no-default named parent is pinned and stop or replacement fails closed"
 }
 
 test_stopped_owned_lab_can_reprovision() {
@@ -538,6 +596,7 @@ test_refuses_unsafe_names
 test_provision_run_and_guarded_teardown
 test_run_scopes_session_before_double_dash
 test_missing_tripwire_blocks_destruction
+test_named_parent_inventory
 test_changed_default_trips_after_teardown
 test_stopped_owned_lab_can_reprovision
 test_failed_delete_retains_tripwire

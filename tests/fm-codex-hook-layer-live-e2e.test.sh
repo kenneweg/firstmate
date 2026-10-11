@@ -91,7 +91,46 @@ test_installed_codex_still_reports_the_hook_feature() {
   printf 'ok - codex %s still publishes the hook feature flag firstmate disables\n' "$CODEX_VERSION"
 }
 
+test_reviewed_guard_uses_only_its_private_sources() {
+  [ "$(uname -s)" = Linux ] || { echo 'skip: reviewed guard source isolation is Linux-only'; return 0; }
+  python3 -c 'import tomllib' 2>/dev/null || { echo 'skip: Python 3.11 required for reviewed guards'; return 0; }
+  local fixture="$TMP_ROOT/guard-sources" role
+  mkdir -p "$fixture/original" "$fixture/project/.codex" "$fixture/project/.git"
+  printf '{}\n' > "$fixture/original/auth.json"
+  python3 - "$fixture" "$CODEX_VERSION" <<'PY'
+import hashlib, json, pathlib, sys
+r=pathlib.Path(sys.argv[1])
+hook={'hooks':{'SessionStart':[{'hooks':[{'type':'command','command':'touch '+str(r/'arbitrary-hook')}]}]}}
+(r/'original/hooks.json').write_text(json.dumps(hook))
+(r/'project/.codex/hooks.json').write_text(json.dumps(hook))
+(r/'original/config.toml').write_text('[hooks.state.previously_trusted]\nenabled=true\ntrusted_hash="old-trust"\n')
+(r/'project/.codex/config.toml').write_text('[features]\nhooks=false\n')
+binary=pathlib.Path('/bin/true').resolve()
+(r/'approved.json').write_text(json.dumps({str(r/'project'):dict(
+ executable=str(binary),sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+ codex_version=sys.argv[2],role_env='FIXTURE_ROLE',root_env='FIXTURE_ROOT',
+ pretool=['pretool','{role}'],stop=['stop','{role}'])}))
+PY
+  for role in worker verifier; do
+    CODEX_HOME="$fixture/original" python3 "$ROOT/bin/fm-codex-guard.py" prepare \
+      "$fixture/approved.json" "$fixture/project" "$fixture/project" "$role" "$fixture/$role" \
+      || fail "codex $CODEX_VERSION: private guard preparation failed"
+    python3 "$ROOT/bin/fm-codex-guard.py" launch "$fixture/$role" -- features list >"$fixture/features" 2>&1 \
+      || fail "codex $CODEX_VERSION: native guard source inventory failed"
+    awk '$1 == "hooks" { print $NF }' "$fixture/features" | grep -qx true \
+      || fail "codex $CODEX_VERSION: reviewed guard launch did not enable hooks"
+    assert_absent "$fixture/arbitrary-hook" "unreviewed source hook ran"
+  done
+  cp "$fixture/original/hooks.json" "$fixture/worker/home/hooks.json"
+  if python3 "$ROOT/bin/fm-codex-guard.py" launch "$fixture/worker" -- features list >"$fixture/rejected" 2>&1; then
+    fail "codex $CODEX_VERSION: additional private hook source reached trust bypass"
+  fi
+  assert_absent "$fixture/arbitrary-hook" "unexpected private hook source ran"
+  printf 'ok - codex %s isolates worker/verifier sources and refuses an additional hook source\n' "$CODEX_VERSION"
+}
+
 test_installed_codex_still_reports_the_hook_feature
 test_installed_codex_disables_hooks_for_the_captured_crewmate_launch
+test_reviewed_guard_uses_only_its_private_sources
 
 echo "# all fm-codex-hook-layer-live-e2e tests passed"

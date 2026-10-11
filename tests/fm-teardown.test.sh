@@ -678,6 +678,9 @@ test_local_only_fork_remote_allows() {
   # The supervision branch's bounded per-task outcome cache is a footprint of
   # the retired task, not a record anything reads after it is gone.
   printf 'fm-branch-outcome-index-v1\t5\t0\t-\n' > "$case_dir/state/.task-x1.branch-outcome-index"
+  mkdir -p "$case_dir/state/task-x1.codex-guard.old/home" "$case_dir/state/task-x1.codex-guard.new/home" "$case_dir/foreign-guard"
+  printf 'fixture auth\n' > "$case_dir/state/task-x1.codex-guard.old/home/auth.json"
+  ln -s "$case_dir/foreign-guard" "$case_dir/state/task-x1.codex-guard.foreign"
 
   set +e
   run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
@@ -685,6 +688,10 @@ test_local_only_fork_remote_allows() {
   set -e
 
   expect_code 0 "$rc" "fork-allow: teardown should succeed when HEAD is on a fork remote"
+  [ ! -e "$case_dir/state/task-x1.codex-guard.old" ] && [ ! -e "$case_dir/state/task-x1.codex-guard.new" ] \
+    || fail 'landed teardown retained credential-bearing guard generations'
+  [ -L "$case_dir/state/task-x1.codex-guard.foreign" ] && [ -d "$case_dir/foreign-guard" ] \
+    || fail 'guard cleanup followed a foreign symlink'
   ! grep -q REFUSED "$case_dir/stderr" || fail "fork-allow: teardown printed a REFUSED line"
   [ ! -e "$case_dir/state/.task-x1.branch-outcome-index" ] \
     || fail "fork-allow: teardown left the task's branch outcome index behind"
@@ -799,6 +806,8 @@ test_local_only_truly_unpushed_refuses() {
   case_dir=$(make_case truly-unpushed)
   write_meta "$case_dir" local-only ship
   wt_commit "$case_dir" "unpushed work"
+  mkdir -p "$case_dir/state/task-x1.codex-guard.retained/home"
+  printf 'fixture auth\n' > "$case_dir/state/task-x1.codex-guard.retained/home/auth.json"
   # No fork, no push to origin, not merged into main.
 
   set +e
@@ -807,6 +816,8 @@ test_local_only_truly_unpushed_refuses() {
   set -e
 
   expect_code 1 "$rc" "truly-unpushed: teardown should refuse"
+  [ -f "$case_dir/state/task-x1.codex-guard.retained/home/auth.json" ] \
+    || fail 'refused teardown erased the active guard home'
   grep -q REFUSED "$case_dir/stderr" || fail "truly-unpushed: no REFUSED line in stderr"
   pass "local-only worktree with truly unpushed work is refused (safety preserved)"
 }

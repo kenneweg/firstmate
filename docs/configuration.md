@@ -845,6 +845,25 @@ Hook entries merge across settings files rather than replacing each other, so th
 The CLI reference documents the one file-or-JSON flag, the settings page documents session precedence, and the hooks page documents the hooks merge: <https://code.claude.com/docs/en/cli-reference>, <https://code.claude.com/docs/en/settings>, <https://code.claude.com/docs/en/hooks>.
 [`fm-spawn.sh`](../bin/fm-spawn.sh) owns the file and the flag.
 
+## Reviewed Codex project guards (config/codex-project-guards.json)
+
+Codex ship and scout launches disable hooks by default.
+The optional local `config/codex-project-guards.json` opts a project into reviewed automatic `PreToolUse` and `Stop` guards, with an explicit worker or verifier identity.
+Approve the exact guard definition and standalone executable before installing this configuration; a hash of an editable wrapper that delegates to project scripts is insufficient.
+[`fm-codex-guard.py --help`](../bin/fm-codex-guard.py) owns the schema, source isolation, authentication constraints, refusal cases, and safety boundary; [`fm-spawn.sh`](../bin/fm-spawn.sh) owns the role flag and relaunch wiring.
+
+This opt-in supports Linux with Python 3.11 or newer, the reviewed Codex version, and file-backed OpenAI authentication.
+It creates a private task home containing a copy of the selected authentication file and only the reviewed hook configuration, so user settings, skills, plugins, and history are not inherited.
+Task homes remain credential-bearing private state until task teardown removes them.
+The original authentication and hook trust stores are unchanged.
+System or managed Codex configuration requires a separate reviewed integration and refuses this path.
+No configuration is inherited into secondmate homes, and the secondmate agent's hook posture is unchanged.
+
+The adapter verifies the native hook inventory before its invocation-local trust bypass, preserving the launch's normal turn-end notification.
+The launcher handles the selected "Open restricted" folder disclosure without persisting project trust; other trust prompts fail rather than receiving a key.
+Codex hooks remain guardrails rather than an OS sandbox: unsupported tool paths and hook failures can fail open, and same-user code can alter its own environment and files.
+The [official hook documentation](https://learn.chatgpt.com/docs/hooks) owns vendor behavior, and [runtime verification](verification/runtime-backends.md#codex-reviewed-project-guards) records the refreshable empirical checks.
+
 ## Claude permission mode (config/claude-permission-mode)
 
 The optional local, gitignored `config/claude-permission-mode` selects the permission flag for every Claude worker launch: crewmates, scouts, Claude secondmates, and control-plane relaunches.
