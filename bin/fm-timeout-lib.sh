@@ -58,6 +58,12 @@
 #       than run unbounded: there is no bash fallback, because a monitor-mode
 #       watchdog cannot replace the caller.
 #
+#   FM_EXEC_TIMED_REAP_GROUP=1
+#       With the Perl fm_exec_timed watchdog, also KILL leftover command-group
+#       descendants after a natural command exit. Use for monitoring reads and
+#       checks that must not detach work. The native fallback has no post-exit
+#       reap; its caller must retain and clean the runner group itself.
+#
 #   fm_timed_out <status>
 #       0 iff <status> is how fm_run_timed or fm_exec_timed reports the bound.
 #
@@ -206,7 +212,7 @@ fm_timed_out() {  # <status>
 # which keeps the bound off perl's platform-dependent syscall-restart signal
 # semantics and off the drift of counting sleep intervals.
 fm_exec_timed() {  # <seconds> <grace-seconds> <command...>
-  local seconds=${1:-} grace=${2:-} value owner
+  local seconds=${1:-} grace=${2:-} value owner reap_group
   for value in "$seconds" "$grace"; do
     case "$value" in
       '' | 0* | *[!0-9]*)
@@ -221,10 +227,11 @@ fm_exec_timed() {  # <seconds> <grace-seconds> <command...>
     exit 125
   fi
   owner=${FM_EXEC_TIMED_OWNER_PID:-$$}
-  unset FM_EXEC_TIMED_OWNER_PID
+  reap_group=${FM_EXEC_TIMED_REAP_GROUP:-0}
+  unset FM_EXEC_TIMED_OWNER_PID FM_EXEC_TIMED_REAP_GROUP
   if command -v perl >/dev/null 2>&1; then
     exec perl -MPOSIX=WNOHANG,setpgid -MTime::HiRes=time -e '
-      my ($bound, $grace, $owner, $shell_parent) = (shift, shift, shift, shift);
+      my ($bound, $grace, $owner, $shell_parent, $reap_group) = (shift, shift, shift, shift, shift);
       # exec preserves the shell PID, including in Bash 3.2 subshells where
       # BASHPID is unavailable. Keep the pre-exec parent for startup races.
       $owner = $shell_parent if $owner == $$;
@@ -250,7 +257,7 @@ fm_exec_timed() {  # <seconds> <grace-seconds> <command...>
       my $deadline = time + $bound;
       sub finish {
         my $status = shift;
-        kill "KILL", -$pid if $kill_at;
+        kill "KILL", -$pid if $kill_at || $reap_group eq "1";
         exit 124 if $timed_out;
         exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
       }
@@ -274,7 +281,7 @@ fm_exec_timed() {  # <seconds> <grace-seconds> <command...>
         }
         select undef, undef, undef, 0.05;
       }
-    ' -- "$seconds" "$grace" "$owner" "$PPID" "$@"
+    ' -- "$seconds" "$grace" "$owner" "$PPID" "$reap_group" "$@"
   elif command -v timeout >/dev/null 2>&1; then
     exec timeout -k "$grace" "$seconds" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then

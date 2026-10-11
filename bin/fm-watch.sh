@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 # Firstmate watcher.
+# Foreground checkpoint close receipts are written only after successful EXIT
+# cleanup; a forced stop leaves singleton/recovery evidence for the next arm.
+# Check and capture groups use fm-timeout-lib.sh with a one-second grace.
+# Its Perl watchdog also detects watcher death; without Perl, those commands
+# still terminate by their own FM_CHECK_TIMEOUT deadline plus grace.
 # Classifies supervision wakes in bash. In normal mode it absorbs benign wakes
 # and keeps blocking; it queues and exits only for actionable wakes.
 # The no-verb signal and stale path is absorb-only-on-positive-evidence: a wake
@@ -2083,17 +2088,13 @@ procevent_surface_queued() {
   wake "$reason"
 }
 
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
+
 run_check_process() {
   local c=$1
   shift
-  if [ "${FM_CHECK_FORCE_FALLBACK:-0}" != 1 ] && command -v timeout >/dev/null 2>&1; then
-    exec timeout "$CHECK_TIMEOUT" bash "$c" "$@"
-  elif [ "${FM_CHECK_FORCE_FALLBACK:-0}" != 1 ] && command -v gtimeout >/dev/null 2>&1; then
-    exec gtimeout "$CHECK_TIMEOUT" bash "$c" "$@"
-  else
-    # shellcheck disable=SC2016  # single quotes are deliberate: Perl expands its own variables.
-    exec perl -e 'my $t = shift; my $owned = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0) unless $owned; exec @ARGV } my $group = $owned ? getpgrp(0) : $pid; my $stop = sub { $SIG{HUP} = $SIG{INT} = $SIG{TERM} = "IGNORE"; kill "TERM", -$group; select undef, undef, undef, 0.2; kill "KILL", -$group; waitpid $pid, 0; exit 124 }; local $SIG{ALRM} = $stop; local $SIG{HUP} = $stop; local $SIG{INT} = $stop; local $SIG{TERM} = $stop; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$CHECK_TIMEOUT" "${FM_CHECK_OWNED_GROUP:-0}" bash "$c" "$@"
-  fi
+  FM_EXEC_TIMED_OWNER_PID=$$ FM_EXEC_TIMED_REAP_GROUP=1 fm_exec_timed "$CHECK_TIMEOUT" 1 bash "$c" "$@"
 }
 
 run_check() {
@@ -2114,10 +2115,11 @@ fm_check_output_cleanup() {
 fm_active_check_stop() {
   local pid=${FM_ACTIVE_CHECK_PID:-} pgid=${FM_ACTIVE_CHECK_PGID:-} i
   [ -n "$pid" ] || [ -n "$pgid" ] || return 0
-  [ -z "$pgid" ] || kill -TERM -- "-$pgid" 2>/dev/null || true
+  # Signal the watchdog, which forwards TERM and escalates its command group.
+  # Killing its group immediately would destroy that owner before its reap.
   [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
   i=0
-  while [ -n "$pgid" ] && kill -0 -- "-$pgid" 2>/dev/null && [ "$i" -lt 20 ]; do
+  while [ -n "$pgid" ] && kill -0 -- "-$pgid" 2>/dev/null && [ "$i" -lt 200 ]; do
     sleep 0.01
     i=$((i + 1))
   done
@@ -2164,7 +2166,7 @@ run_check_capture() {
   # can drop a trap that is pending when one is parsed (watcher_stop_signals).
   trap 'FM_CHECK_SIGNAL_PENDING=1' HUP INT TERM
   set -m
-  ( FM_CHECK_OWNED_GROUP=1 run_check_process "$@" ) > "$FM_CHECK_OUTPUT" 2>/dev/null &
+  ( run_check_process "$@" ) > "$FM_CHECK_OUTPUT" 2>/dev/null &
   FM_ACTIVE_CHECK_PID=$!
   FM_ACTIVE_CHECK_PGID=$FM_ACTIVE_CHECK_PID
   set +m
@@ -2206,7 +2208,15 @@ watcher_capture() {  # <backend> <target> <lines> [expected-label]
   # print a harmless "child setpgid ... Operation not permitted" race from the
   # child before the command's own redirections apply.
   set -m
-  { fm_backend_capture "$@" < /dev/null > "$FM_CAPTURE_OUTPUT" & } 2>/dev/null
+  # Each capture has a watchdog outside its command group. It survives a
+  # KILL of the watcher and notices owner death, so separate groups cannot
+  # escape a checkpoint escalation. Dispatch stays backend-independent.
+  # shellcheck disable=SC2016 # The capture shell sources its own adapter.
+  { ( FM_EXEC_TIMED_OWNER_PID=$$ FM_EXEC_TIMED_REAP_GROUP=1 fm_exec_timed "$CHECK_TIMEOUT" 1 bash -c '
+      . "$1"
+      shift
+      fm_backend_capture "$@"
+    ' _ "$SCRIPT_DIR/fm-backend.sh" "$@" ) < /dev/null > "$FM_CAPTURE_OUTPUT" & } 2>/dev/null
   FM_ACTIVE_CHECK_PID=$!
   FM_ACTIVE_CHECK_PGID=$FM_ACTIVE_CHECK_PID
   set +m
@@ -2597,6 +2607,9 @@ watcher_cleanup() {
       downtime "$CLEANUP_LOCK_BOUND"; then
     echo "watcher: recovery state could not be persisted; retaining stale lock evidence" >&2
     cleanup_status=1
+  fi
+  if [ "$cleanup_status" -eq 0 ] && [ -n "${FM_WATCH_CHECKPOINT_CLOSED:-}" ]; then
+    printf 'closed\n' > "$FM_WATCH_CHECKPOINT_CLOSED" || cleanup_status=1
   fi
   return "$cleanup_status"
 }

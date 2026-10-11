@@ -394,6 +394,27 @@ test_run_timed_passes_a_natural_exit_through_a_fired_bound() {
   pass 'fm_run_timed passes a natural exit through when the bound fired after completion'
 }
 
+test_optional_reap_stops_a_naturally_detached_descendant() {
+  local dir out rc=0 pid state
+  dir="$TMP_ROOT/natural-reap"
+  mkdir -p "$dir"
+  # The command exits naturally with a status and leaves a resistant child
+  # holding stdout. The opted-in watchdog must reap that group immediately.
+  # shellcheck disable=SC2016
+  out=$(FM_EXEC_TIMED_REAP_GROUP=1 exec_timed "$PERL_ONLY" 5 1 bash -c '
+    ( trap "" TERM; exec sleep 300 ) &
+    echo $! > "$1"
+    echo natural
+    exit 7
+  ' _ "$dir/pid") || rc=$?
+  expect_code 7 "$rc" "normal completion status must survive group reap"
+  assert_equals natural "$out" "normal completion output must survive group reap"
+  pid=$(cat "$dir/pid")
+  state=$(ps -o stat= -p "$pid" 2>/dev/null || true)
+  case "$state" in ''|*Z*) ;; *) kill -KILL "$pid"; fail "natural-exit group reap left a live descendant" ;; esac
+  pass "fm_exec_timed can reap a leftover group after natural completion without losing status or output"
+}
+
 test_passes_the_command_status_and_output_through
 test_system_bash_preserves_completion_and_signal_statuses
 test_run_timed_reports_the_bound_when_the_wrapper_records_a_signal_death
@@ -411,3 +432,5 @@ test_refuses_rather_than_running_unbounded
 test_rejects_malformed_bounds_before_running_anything
 test_gnu_timeout_kills_a_term_ignoring_command_after_the_grace
 test_timed_out_names_exactly_the_bound_statuses
+
+test_optional_reap_stops_a_naturally_detached_descendant

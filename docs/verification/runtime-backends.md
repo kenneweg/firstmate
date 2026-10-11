@@ -6,6 +6,33 @@ This record contains reusable version-scoped evidence for active runtime guarant
 The backend guides own current setup, safety boundaries, and limitations.
 Exact task chronology, branch names, temporary homes, local paths, process ids, thread ids, and delivery transcripts remain in private reports or PR evidence.
 
+## Foreground checkpoint termination
+
+Verified on 2026-10-11 with Bash 5.3.9, Perl 5.40.1, and uutils coreutils timeout 0.10.0 on Linux.
+`bin/fm-watch-checkpoint.sh` owns deadline, cleanup grace, and close-receipt classification; `bin/fm-timeout-lib.sh` owns bounded execution and the optional natural-return group reap.
+Refresh the portable behavior evidence with:
+
+```sh
+bash bin/fm-test-run.sh tests/fm-watch-checkpoint.test.sh tests/fm-timeout-lib.test.sh
+```
+
+The completed regressions report:
+
+```text
+ok - quiet checkpoint exits 124 with a clean checkpoint line and no live lock
+ok - TERM-resistant checkpoint escalates within its grace and reports an abnormal stop
+ok - forced watcher stop cleans its separate child group, retains evidence and recovers without signaling a sibling
+ok - normal watcher close stops a resistant check and its descendant before reporting quiet
+ok - fm_exec_timed can reap a leftover group after natural completion without losing status or output
+```
+
+The resistant-checkpoint case exercises the preferred Perl watchdog and native timeout selection without Perl, including the `gtimeout` selection through a wrapper around the installed timeout binary.
+It is not evidence from a native macOS `gtimeout` installation.
+The stopped-watcher fixture uses STOP to make escalation deterministic; it does not reproduce or explain an initiating watcher stall.
+Separate check and capture groups use the shared runner across tmux, Herdr, Zellij, Orca, and cmux dispatch; this evidence concerns process ownership and termination, not a new live backend or harness certification.
+Without Perl, the library's documented native fallback does not detect owner death, so a separate group remains bounded by its own command deadline rather than immediate owner-death cleanup.
+
+
 ## Harness detection precedence
 
 Firstmate's own harness comes from two kinds of evidence, and `bin/fm-harness.sh` owns how they combine: an environment marker names its harness, and the nearest harness process in the parent chain proves who owns the process tree.

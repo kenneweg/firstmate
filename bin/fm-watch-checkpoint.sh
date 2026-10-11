@@ -31,6 +31,8 @@ Usage: fm-watch-checkpoint.sh [--seconds <n>]
 
 Run bin/fm-watch.sh in the foreground for a bounded checkpoint.
 On an actionable watcher wake, pass through the watcher output and exit 0.
+On an unclean deadline stop, report failure and retain recovery evidence (exit 1).
+The deadline permits eight additional seconds for cleanup before KILL.
 On a quiet checkpoint, print "checkpoint: no actionable wake within <n>s" and exit 124.
 EOF
 }
@@ -68,45 +70,19 @@ ERR=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.err.XXXXXX") || {
   rm -f "$OUT"
   exit 1
 }
-trap 'rm -f "$OUT" "$ERR"' EXIT
-
-run_with_perl_timeout() {  # <seconds> <command...>
-  perl -e '
-    my $seconds = shift;
-    my $pid = fork;
-    die "fork failed\n" unless defined $pid;
-    if (!$pid) {
-      setpgrp(0, 0);
-      exec @ARGV;
-      die "exec failed: $!\n";
-    }
-    local $SIG{ALRM} = sub {
-      kill "TERM", -$pid;
-      my $grace = $ENV{FM_SIGNAL_GRACE} || 5;
-      local $SIG{ALRM} = sub {
-        kill "KILL", -$pid;
-        waitpid $pid, 0;
-        exit 124;
-      };
-      alarm $grace;
-      waitpid $pid, 0;
-      exit 124;
-    };
-    alarm $seconds;
-    waitpid $pid, 0;
-    alarm 0;
-    exit($? >> 8);
-  ' "$@"
+CLOSED=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.closed.XXXXXX") || {
+  rm -f "$OUT" "$ERR"
+  exit 1
 }
+trap 'rm -f "$OUT" "$ERR" "$CLOSED"' EXIT
 
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
+
+# Allow the watcher's child stop (two seconds) and recovery lock (two
+# seconds by default) to finish, then escalate through the shared owner.
 run_bounded() {  # <seconds> <command...>
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$@"
-  elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$@"
-  else
-    run_with_perl_timeout "$@"
-  fi
+  ( fm_exec_timed "$1" 8 "${@:2}" )
 }
 
 positive_or() {  # <value> <default>
@@ -132,6 +108,12 @@ if fm_supervision_host_enabled "$CONFIG" codex; then
     run_bounded $((LIMIT + 120)) "$SCRIPT_DIR/fm-supervision-host.sh" park >"$OUT" 2>"$ERR"
   RC=$?
   set -e
+  if fm_timed_out "$RC"; then
+    [ ! -s "$OUT" ] || cat "$OUT"
+    [ ! -s "$ERR" ] || cat "$ERR" >&2
+    echo "checkpoint: the supervision host outlived its own bound of ${BOUND}s" >&2
+    exit 1
+  fi
   if grep -E '^(signal:|stale:|check:|heartbeat($|:)|supervision-host:)' "$OUT" 2>/dev/null \
     | grep -Ev '^supervision-host: cycle boundary' >/dev/null; then
     grep -Ev '^watcher: (started|attached) ' "$OUT"
@@ -144,20 +126,26 @@ if fm_supervision_host_enabled "$CONFIG" codex; then
   fi
   [ ! -s "$OUT" ] || cat "$OUT"
   [ ! -s "$ERR" ] || cat "$ERR" >&2
-  if [ "$RC" -eq 124 ]; then
-    echo "checkpoint: the supervision host outlived its own bound of ${BOUND}s" >&2
-    exit 1
-  fi
   [ "$RC" -ne 0 ] || RC=1
   exit "$RC"
 fi
 
 set +e
-run_bounded "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR"
+FM_WATCH_CHECKPOINT_CLOSED="$CLOSED" run_bounded "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR"
 RC=$?
 set -e
 
-if grep -E '^(signal:|stale:|check:|heartbeat($|:))' "$OUT" >/dev/null 2>&1; then
+# A deadline alone cannot prove a clean stop: a forced watcher leaves its
+# lock/recovery evidence intact. Never turn that failure into a quiet result,
+# even if partial output already contains a reason line.
+if fm_timed_out "$RC" && [ ! -s "$CLOSED" ]; then
+  [ ! -s "$OUT" ] || cat "$OUT"
+  [ ! -s "$ERR" ] || cat "$ERR" >&2
+  echo "checkpoint: watcher did not close cleanly within ${SECONDS_ARG}s plus 8s cleanup grace; recovery evidence retained" >&2
+  exit 1
+fi
+
+if grep -E '^(signal:|stale:|check:|heartbeat($|:))'  "$OUT" >/dev/null 2>&1; then
   cat "$OUT"
   [ ! -s "$ERR" ] || cat "$ERR" >&2
   exit 0

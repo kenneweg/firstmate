@@ -7,6 +7,8 @@ set -u
 
 CHECKPOINT="$ROOT/bin/fm-watch-checkpoint.sh"
 TMP_ROOT=$(fm_test_tmproot fm-watch-checkpoint)
+SIBLING_PID=
+trap '[ -z "$SIBLING_PID" ] || { kill "$SIBLING_PID" 2>/dev/null || true; wait "$SIBLING_PID" 2>/dev/null || true; }; fm_test_cleanup' EXIT
 
 make_home() {
   local name=$1 home
@@ -89,6 +91,7 @@ make_host_home() {  # <name>
   home=$(make_home "$1")
   mkdir -p "$home/root/bin"
   cp "$CHECKPOINT" "$home/root/bin/fm-watch-checkpoint.sh"
+  cp "$ROOT/bin/fm-timeout-lib.sh" "$home/root/bin/fm-timeout-lib.sh"
   cp "$ROOT/bin/fm-supervision-engine-lib.sh" "$home/root/bin/fm-supervision-engine-lib.sh"
   cat > "$home/root/bin/fm-supervision-host.sh" <<'SH'
 #!/usr/bin/env bash
@@ -100,6 +103,7 @@ case "$(cat "$FM_HOME/host-kind")" in
     printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
     printf 'signal: demo.status\nsupervision-host: the away session could not take this wake: fixture; this wake is yours\n'
     ;;
+  timed-out) printf 'signal: partial-host-output\n'; exit 124 ;;
   stood-down) printf 'supervision-host stood down: this session no longer owns supervision\n' ;;
 esac
 SH
@@ -156,6 +160,9 @@ test_host_checkpoint_passes_a_handback_and_reports_a_stand_down() {
   run_host_checkpoint "$home" stood-down --seconds 5
   expect_code 1 "$STATUS" "a host that stood down is a failed checkpoint"
   assert_contains "$(cat "$home/out.txt")" "supervision-host stood down" "the stand-down must be shown"
+  run_host_checkpoint "$home" timed-out --seconds 5
+  expect_code 1 "$STATUS" "a host timeout must fail despite partial wake output"
+  assert_contains "$(cat "$home/err.txt")" 'outlived its own bound' "host timeout was not explained"
   pass "checkpoint: a handed-back wake passes through, and a host stand-down is a failure"
 }
 
@@ -196,6 +203,145 @@ test_real_host_checkpoint_ends_quietly_at_its_bound() {
   pass "checkpoint: the real host ends its park at the checkpoint bound as a quiet checkpoint"
 }
 
+# The fixture exposes only its own script and processes; partial reason output
+# must not turn a TERM-resistant deadline stop into successful supervision.
+test_term_resistant_checkpoint_is_bounded_and_abnormal() {
+  local home status started elapsed mechanism path tool
+  home=$(make_host_home resistant)
+  rm "$home/config/supervision-host"
+  cat > "$home/root/bin/fm-watch.sh" <<'SH'
+#!/usr/bin/env bash
+trap '' TERM
+printf 'signal: partial-fixture-output\n'
+printf 'retained\n' > "$FM_HOME/state/recovery-evidence"
+while :; do sleep 1; done
+SH
+  chmod +x "$home/root/bin/fm-watch.sh"
+  for mechanism in perl timeout gtimeout; do
+    path=$PATH
+    if [ "$mechanism" != perl ]; then
+      command -v timeout >/dev/null 2>&1 || continue
+      path="$home/$mechanism-bin"
+      mkdir -p "$path"
+      for tool in bash dirname mktemp grep cat rm sleep; do
+        ln -s "$(command -v "$tool")" "$path/$tool"
+      done
+      if [ "$mechanism" = timeout ]; then
+        ln -s "$(command -v timeout)" "$path/timeout"
+      else
+        # A multicall coreutils binary may reject argv[0]=gtimeout; preserve
+        # its real name while exercising the library's gtimeout selection.
+        printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$(command -v timeout)" > "$path/gtimeout"
+        chmod +x "$path/gtimeout"
+      fi
+    fi
+    started=$SECONDS
+    status=0
+    PATH="$path" FM_HOME="$home" "$home/root/bin/fm-watch-checkpoint.sh" --seconds 1 >"$home/out" 2>"$home/err" || status=$?
+    elapsed=$((SECONDS - started))
+    expect_code 1 "$status" "$mechanism forced stop must fail, even with partial wake output"
+    [ "$elapsed" -ge 8 ] && [ "$elapsed" -le 13 ] || fail "$mechanism resistant checkpoint took ${elapsed}s"
+    assert_contains "$(cat "$home/err")" 'did not close cleanly' "forced stop was not explained"
+    assert_not_contains "$(cat "$home/out")" 'no actionable wake' "forced stop was presented as quiet"
+    assert_present "$home/state/recovery-evidence" "forced stop lost recovery evidence"
+  done
+  pass "TERM-resistant checkpoint escalates within its grace and reports an abnormal stop"
+
+}
+
+wait_fixture_file() {
+  local file=$1 i=0
+  while [ ! -s "$file" ] && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
+  [ -s "$file" ] || fail "fixture did not publish $file"
+}
+
+fixture_process_running() {
+  local state
+  state=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+  case "$state" in ''|*Z*) return 1 ;; *) return 0 ;; esac
+}
+
+test_forced_watcher_stop_cleans_owned_child_and_recovers() {
+  local home sibling checkpoint watcher child descendant i status started
+  home=$(make_home forced-real)
+  # A live process in another home is never a signaling target.
+  sibling=$(make_home live-sibling)
+  sleep 60 &
+  SIBLING_PID=$!
+  printf '%s\n' "$SIBLING_PID" > "$sibling/state/.lock"
+  cat > "$home/state/resistant.check.sh" <<'SH'
+#!/usr/bin/env bash
+trap '' TERM
+printf '%s\n' "$$" > "$FM_HOME/child.pid"
+sleep 100 &
+printf '%s\n' "$!" > "$FM_HOME/descendant.pid"
+wait
+SH
+  chmod 0700 "$home/state/resistant.check.sh"
+  FM_HOME="$home" "$ROOT/bin/fm-check-register.sh" resistant >/dev/null || fail "register fixture"
+  started=$SECONDS
+  FM_HOME="$home" FM_CHECK_INTERVAL=1 FM_POLL=1 FM_HEARTBEAT=999999 "$CHECKPOINT" --seconds 4 >"$home/out" 2>"$home/err" &
+  checkpoint=$!
+  wait_fixture_file "$home/child.pid"
+  child=$(cat "$home/child.pid")
+  wait_fixture_file "$home/descendant.pid"
+  descendant=$(cat "$home/descendant.pid")
+  watcher=$(cat "$home/state/.watch.lock/pid")
+  [ "$(ps -o pgid= -p "$child" | tr -d ' ')" != "$(ps -o pgid= -p "$watcher" | tr -d ' ')" ] || fail "fixture child must have a separate group"
+  # STOP is a deterministic stand-in for the unknown initiating stall, not a
+  # claimed reproduction. Only this fixture's lock-owning watcher is stopped.
+  kill -STOP "$watcher" || fail "stop fixture watcher"
+  status=0
+  wait "$checkpoint" || status=$?
+  expect_code 1 "$status" "stalled real watcher must fail its checkpoint"
+  [ "$((SECONDS - started))" -le 16 ] || fail "real checkpoint exceeded bound plus grace"
+  i=0
+  while fixture_process_running "$child" && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
+  if fixture_process_running "$child"; then kill -KILL "$child"; fail "separate check group survived owner death"; fi
+  if fixture_process_running "$descendant"; then kill -KILL "$descendant"; fail "check descendant survived group cleanup"; fi
+  assert_present "$home/state/.watch.lock/pid" "forced stop must retain dead lock evidence"
+  kill -0 "$SIBLING_PID" || fail "sibling home process was signaled"
+  # The next real checkpoint owns reclaim/recovery; the parent never erases
+  # the stale lock or pretends it was a clean close.
+  status=0
+  FM_HOME="$home" FM_CHECK_INTERVAL=999999 FM_POLL=1 "$CHECKPOINT" --seconds 5 >"$home/recovered" 2>"$home/recovered.err" || status=$?
+  expect_code 0 "$status" "recovery must produce a real wake: $(cat "$home/recovered.err")"
+  assert_contains "$(cat "$home/recovered")" 'check: rearm-resurface' "retained evidence was not resurfaced"
+  kill -0 "$SIBLING_PID" || fail "recovery signaled a sibling"
+  kill "$SIBLING_PID"
+  wait "$SIBLING_PID" 2>/dev/null || true
+  SIBLING_PID=
+  pass "forced watcher stop cleans its separate child group, retains evidence and recovers without signaling a sibling"
+}
+
+
+test_normal_close_cleans_a_term_resistant_check_group() {
+  local home child descendant status i
+  home=$(make_home clean-resistant)
+  cat > "$home/state/resistant.check.sh" <<'SH'
+#!/usr/bin/env bash
+trap '' TERM
+printf '%s\n' "$$" > "$FM_HOME/child.pid"
+sleep 100 &
+printf '%s\n' "$!" > "$FM_HOME/descendant.pid"
+wait
+SH
+  chmod 0700 "$home/state/resistant.check.sh"
+  FM_HOME="$home" "$ROOT/bin/fm-check-register.sh" resistant >/dev/null || fail "register fixture"
+  status=0
+  FM_HOME="$home" FM_CHECK_INTERVAL=1 FM_POLL=1 FM_HEARTBEAT=999999 "$CHECKPOINT" --seconds 4 >"$home/out" 2>"$home/err" || status=$?
+  expect_code 124 "$status" "a cooperative watcher must close cleanly despite a resistant check: $(cat "$home/err")"
+  wait_fixture_file "$home/descendant.pid"
+  child=$(cat "$home/child.pid")
+  descendant=$(cat "$home/descendant.pid")
+  for i in "$child" "$descendant"; do
+    if fixture_process_running "$i"; then kill -KILL "$i"; fail "clean watcher close left process $i running"; fi
+  done
+  assert_absent "$home/state/.watch.lock/pid" "clean close left a singleton lock"
+  assert_contains "$(cat "$home/out")" 'no actionable wake' "clean close lost quiet classification"
+  pass "normal watcher close stops a resistant check and its descendant before reporting quiet"
+}
+
 test_quiet_checkpoint_exits_124_cleanly
 test_signal_passes_through_and_exits_zero
 test_registered_check_uses_preserved_watcher_environment
@@ -204,3 +350,8 @@ test_host_checkpoint_bounds_the_park_by_posture
 test_host_checkpoint_passes_a_handback_and_reports_a_stand_down
 test_host_checkpoint_needs_the_file_and_honors_off
 test_real_host_checkpoint_ends_quietly_at_its_bound
+
+test_term_resistant_checkpoint_is_bounded_and_abnormal
+test_forced_watcher_stop_cleans_owned_child_and_recovers
+
+test_normal_close_cleans_a_term_resistant_check_group
